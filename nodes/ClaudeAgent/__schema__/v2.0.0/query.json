@@ -1,0 +1,92 @@
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"type": "object",
+	"properties": {
+		"prompt": {
+			"type": "string",
+			"description": "The instruction to send to Claude Agent"
+		},
+		"cwd": {
+			"type": "string",
+			"description": "Directory where Claude Agent operates"
+		},
+		"model": {
+			"type": "string",
+			"enum": ["sonnet", "opus", "haiku"],
+			"description": "Claude model to use"
+		},
+		"permissionMode": {
+			"type": "string",
+			"enum": ["bypassPermissions", "acceptEdits", "default", "plan"],
+			"description": "How to handle tool permissions"
+		},
+		"maxTurns": {
+			"type": "number",
+			"description": "Maximum conversation turns (0 = unlimited)"
+		},
+		"timeout": {
+			"type": "number",
+			"description": "Maximum execution time in seconds (0 = unlimited)"
+		},
+		"outputFormat": {
+			"type": "string",
+			"enum": ["summary", "full", "text"],
+			"description": "How to format the output"
+		},
+		"advancedOptions": {
+			"type": "object",
+			"properties": {
+				"systemPromptMode": {
+					"type": "string",
+					"enum": ["default", "append", "custom"],
+					"description": "How to configure the system prompt"
+				},
+				"appendSystemPrompt": {
+					"type": "string",
+					"description": "Additional instructions appended to default"
+				},
+				"customSystemPrompt": {
+					"type": "string",
+					"description": "Completely replace the default system prompt"
+				},
+				"fallbackModel": {
+					"type": "string",
+					"enum": ["", "sonnet", "opus", "haiku"],
+					"description": "Switch to this if primary model is overloaded"
+				},
+				"maxThinkingTokens": {
+					"type": "number",
+					"description": "Limit extended thinking (0 = unlimited)"
+				},
+				"allowedTools": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Limit to specific tools (empty = allow all)"
+				},
+				"disallowedTools": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Block specific tools (overrides allowed)"
+				},
+				"additionalDirectories": {
+					"type": "string",
+					"description": "Extra directories to grant access (comma-separated)"
+				},
+				"debug": {
+					"type": "boolean",
+					"description": "Enable detailed logging"
+				},
+				"includePartialMessages": {
+					"type": "boolean",
+					"description": "Include real-time streaming events (full format only)"
+				}
+			}
+		}
+	},
+	"required": ["prompt"],
+	"additionalProperties": false
+}

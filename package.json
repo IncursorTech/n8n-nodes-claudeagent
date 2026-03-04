@@ -1,0 +1,56 @@
+{
+  "name": "@incursor/n8n-nodes-claudeagent",
+  "version": "1.0.0",
+  "description": "n8n community node for Claude Agent SDK integration (Incursor fork)",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "claude",
+    "claude-agent",
+    "ai",
+    "anthropic",
+    "automation",
+    "workflow"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/IncursorTech/n8n-nodes-claudeagent#readme",
+  "bugs": {
+    "url": "https://github.com/IncursorTech/n8n-nodes-claudeagent/issues"
+  },
+  "author": {
+    "name": "Incursor Tech",
+    "email": "info@incursor.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IncursorTech/n8n-nodes-claudeagent.git"
+  },
+  "engines": {
+    "node": ">=20.15"
+  },
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc && cp nodes/ClaudeAgent/claudeagent.svg dist/nodes/ClaudeAgent/ && cp -r nodes/ClaudeAgent/__schema__ dist/nodes/ClaudeAgent/",
+    "dev": "tsc --watch"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "nodes": [
+      "dist/nodes/ClaudeAgent/ClaudeAgent.node.js"
+    ]
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.10"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.1",
+    "n8n-workflow": "^1.117.0",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  }
+}
