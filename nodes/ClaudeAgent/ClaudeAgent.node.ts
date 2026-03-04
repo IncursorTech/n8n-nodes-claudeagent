@@ -7,6 +7,8 @@ import type {
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 import {
 	query,
+	tool,
+	createSdkMcpServer,
 	type SDKMessage,
 	type SDKResultMessage,
 	type SDKSystemMessage,
@@ -15,8 +17,9 @@ import {
 	type NonNullableUsage,
 	type ModelUsage,
 } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
-// ========== 输出格式类型定义 ==========
+// ========== Output Format Type Definitions ==========
 interface TextOutput {
 	result: string;
 }
@@ -25,7 +28,7 @@ interface SummaryOutput {
 	session_id: string;
 	success: boolean;
 	result: string | null;
-	error_type?: 'error_max_turns' | 'error_during_execution';
+	error_type?: 'error_max_turns' | 'error_during_execution' | 'error_max_budget_usd';
 
 	metrics: {
 		turns: number;
@@ -70,6 +73,13 @@ interface SummaryOutput {
 	}>;
 }
 
+interface StructuredOutput {
+	structured_output: unknown;
+	session_id: string;
+	success: boolean;
+	metrics: { turns: number; duration_ms: number; cost_usd: number };
+}
+
 interface FullOutput {
 	messages: SDKMessage[];
 
@@ -112,7 +122,7 @@ interface FullOutput {
 	};
 }
 
-// ========== 辅助函数 ==========
+// ========== Helper Functions ==========
 function extractUserText(msg: SDKUserMessage): string {
 	const content = msg.message.content;
 	if (typeof content === 'string') {
@@ -125,15 +135,44 @@ function extractUserText(msg: SDKUserMessage): string {
 	return '';
 }
 
+function jsonSchemaToZodShape(schema: any): Record<string, z.ZodTypeAny> {
+	const shape: Record<string, z.ZodTypeAny> = {};
+	if (schema?.properties) {
+		const required = new Set(schema.required || []);
+		for (const [key, prop] of Object.entries<any>(schema.properties)) {
+			let zodType: z.ZodTypeAny;
+			switch (prop.type) {
+				case 'number':
+				case 'integer':
+					zodType = z.number();
+					break;
+				case 'boolean':
+					zodType = z.boolean();
+					break;
+				default:
+					zodType = z.string();
+			}
+			if (prop.description) {
+				zodType = zodType.describe(prop.description);
+			}
+			if (!required.has(key)) {
+				zodType = zodType.optional();
+			}
+			shape[key] = zodType;
+		}
+	}
+	return shape;
+}
+
 function formatAsText(messages: SDKMessage[]): TextOutput {
 	const resultMsg = messages.find((m) => m.type === 'result') as SDKResultMessage | undefined;
 
-	// 成功情况
+	// Success
 	if (resultMsg?.subtype === 'success' && resultMsg.result) {
 		return { result: resultMsg.result };
 	}
 
-	// 错误情况
+	// Error cases
 	if (resultMsg?.subtype === 'error_max_turns') {
 		return { result: 'Error: Maximum turns reached. Increase maxTurns or set to 0.' };
 	}
@@ -142,7 +181,11 @@ function formatAsText(messages: SDKMessage[]): TextOutput {
 		return { result: 'Error: Execution failed. Enable debug mode for details.' };
 	}
 
-	// 尝试提取最后的助手消息
+	if (resultMsg?.subtype === 'error_max_budget_usd') {
+		return { result: 'Error: Maximum budget exceeded. Increase maxBudgetUsd or set to 0.' };
+	}
+
+	// Try to extract last assistant message
 	const assistantMessages = messages.filter((m) => m.type === 'assistant') as SDKAssistantMessage[];
 	if (assistantMessages.length > 0) {
 		const last = assistantMessages[assistantMessages.length - 1];
@@ -161,7 +204,7 @@ function formatAsSummary(messages: SDKMessage[]): SummaryOutput {
 		| SDKSystemMessage
 		| undefined;
 
-	// 统计工具使用
+	// Count tool usage
 	const toolsUsed = new Set<string>();
 	messages.forEach((m) => {
 		if (m.type === 'assistant') {
@@ -174,7 +217,7 @@ function formatAsSummary(messages: SDKMessage[]): SummaryOutput {
 		}
 	});
 
-	// 统计消息
+	// Count messages
 	const userMsgCount = messages.filter((m) => m.type === 'user').length;
 	const assistantMsgCount = messages.filter((m) => m.type === 'assistant').length;
 
@@ -237,6 +280,29 @@ function formatAsSummary(messages: SDKMessage[]): SummaryOutput {
 	};
 }
 
+function formatAsStructured(messages: SDKMessage[]): StructuredOutput {
+	const resultMsg = messages.find((m) => m.type === 'result') as SDKResultMessage | undefined;
+	const systemInit = messages.find((m) => m.type === 'system' && (m as any).subtype === 'init') as
+		| SDKSystemMessage
+		| undefined;
+
+	let structuredOutput: unknown = null;
+	if (resultMsg?.subtype === 'success') {
+		structuredOutput = resultMsg.structured_output ?? null;
+	}
+
+	return {
+		structured_output: structuredOutput,
+		session_id: resultMsg?.session_id || systemInit?.session_id || 'unknown',
+		success: resultMsg?.subtype === 'success',
+		metrics: {
+			turns: resultMsg?.num_turns || 0,
+			duration_ms: resultMsg?.duration_ms || 0,
+			cost_usd: resultMsg?.total_cost_usd || 0,
+		},
+	};
+}
+
 function formatAsFull(messages: SDKMessage[]): FullOutput {
 	const systemInit = messages.find((m) => m.type === 'system' && (m as any).subtype === 'init') as
 		| SDKSystemMessage
@@ -244,13 +310,13 @@ function formatAsFull(messages: SDKMessage[]): FullOutput {
 
 	const resultMsg = messages.find((m) => m.type === 'result') as SDKResultMessage | undefined;
 
-	// 构建时间线
+	// Build timeline
 	const timeline: FullOutput['parsed']['timeline'] = [];
 	let currentTurn: any = null;
 
 	messages.forEach((m) => {
 		if (m.type === 'user' && !(m as any).isSynthetic) {
-			// 新的用户消息 = 新一轮
+			// New user message = new turn
 			currentTurn = {
 				turn: timeline.length + 1,
 				user: extractUserText(m as SDKUserMessage),
@@ -261,13 +327,13 @@ function formatAsFull(messages: SDKMessage[]): FullOutput {
 		} else if (m.type === 'assistant' && currentTurn) {
 			const assistantMsg = m as SDKAssistantMessage;
 
-			// 提取文本
+			// Extract text
 			const textContent = assistantMsg.message.content.find((c: any) => c.type === 'text');
 			if (textContent) {
 				currentTurn.assistant = (textContent as any).text;
 			}
 
-			// 提取工具使用
+			// Extract tool usage
 			assistantMsg.message.content.forEach((content: any) => {
 				if (content.type === 'tool_use') {
 					currentTurn.tools.push({
@@ -318,7 +384,7 @@ function formatAsFull(messages: SDKMessage[]): FullOutput {
 	};
 }
 
-// ========== 节点类定义 ==========
+// ========== Node Class Definition ==========
 export class ClaudeAgent implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Claude Agent',
@@ -331,10 +397,13 @@ export class ClaudeAgent implements INodeType {
 		defaults: {
 			name: 'Claude Agent',
 		},
-		inputs: [{ type: NodeConnectionTypes.Main }],
+		inputs: [
+			{ displayName: 'Data', type: NodeConnectionTypes.Main },
+			{ displayName: '', type: NodeConnectionTypes.AiTool },
+		],
 		outputs: [{ type: NodeConnectionTypes.Main }],
 		properties: [
-			// ============ 会话管理 ============
+			// ============ Session Management ============
 			{
 				displayName: 'Operation',
 				name: 'operation',
@@ -385,7 +454,7 @@ export class ClaudeAgent implements INodeType {
 				placeholder: '550e8400-e29b-41d4-a716-446655440000',
 			},
 
-			// ============ 提示词 ============
+			// ============ Prompt ============
 			{
 				displayName: 'Prompt',
 				name: 'prompt',
@@ -399,7 +468,7 @@ export class ClaudeAgent implements INodeType {
 				placeholder: 'Create a Python function to parse CSV files and extract email addresses',
 			},
 
-			// ============ 工作环境 ============
+			// ============ Working Environment ============
 			{
 				displayName: 'Working Directory',
 				name: 'cwd',
@@ -410,7 +479,7 @@ export class ClaudeAgent implements INodeType {
 				hint: 'Leave empty to use current directory',
 			},
 
-			// ============ 模型配置 ============
+			// ============ Model Configuration ============
 			{
 				displayName: 'Model',
 				name: 'model',
@@ -461,12 +530,22 @@ export class ClaudeAgent implements INodeType {
 						value: 'plan',
 						description: 'Plan first, then execute',
 					},
+					{
+						name: "Don't Ask",
+						value: 'dontAsk',
+						description: "Deny operations that aren't pre-approved",
+					},
+					{
+						name: 'Delegate',
+						value: 'delegate',
+						description: 'Restrict to Teammate and Task tools only',
+					},
 				],
 				default: 'bypassPermissions',
 				description: 'How to handle tool permissions',
 			},
 
-			// ============ 执行限制 ============
+			// ============ Execution Limits ============
 			{
 				displayName: 'Max Turns',
 				name: 'maxTurns',
@@ -485,7 +564,16 @@ export class ClaudeAgent implements INodeType {
 				hint: '0 = unlimited (recommended)',
 			},
 
-			// ============ 输出配置 ============
+			{
+				displayName: 'Max Budget (USD)',
+				name: 'maxBudgetUsd',
+				type: 'number',
+				default: 0,
+				hint: '0 = unlimited',
+				typeOptions: { minValue: 0, numberPrecision: 2 },
+			},
+
+			// ============ Output Configuration ============
 			{
 				displayName: 'Output Format',
 				name: 'outputFormat',
@@ -507,12 +595,31 @@ export class ClaudeAgent implements INodeType {
 						value: 'text',
 						description: 'Just the final result text',
 					},
+					{
+						name: 'Structured (JSON Schema)',
+						value: 'structured',
+						description: 'Structured JSON output matching a schema',
+					},
 				],
 				default: 'summary',
 				description: 'How to format the output',
 			},
 
-			// ============ 高级选项 ============
+			{
+				displayName: 'Output JSON Schema',
+				name: 'outputJsonSchema',
+				type: 'json',
+				default:
+					'{\n  "type": "object",\n  "properties": {\n    "result": { "type": "string" }\n  },\n  "required": ["result"]\n}',
+				required: true,
+				displayOptions: {
+					show: {
+						outputFormat: ['structured'],
+					},
+				},
+			},
+
+			// ============ Advanced Options ============
 			{
 				displayName: 'Advanced Options',
 				name: 'advancedOptions',
@@ -520,7 +627,7 @@ export class ClaudeAgent implements INodeType {
 				placeholder: 'Add Option',
 				default: {},
 				options: [
-					// --- 系统提示 ---
+					// --- System Prompt ---
 					{
 						displayName: 'System Prompt Mode',
 						name: 'systemPromptMode',
@@ -563,7 +670,7 @@ export class ClaudeAgent implements INodeType {
 						description: 'Completely replace the default system prompt',
 					},
 
-					// --- 模型配置 ---
+					// --- Model Configuration ---
 					{
 						displayName: 'Fallback Model',
 						name: 'fallbackModel',
@@ -585,18 +692,25 @@ export class ClaudeAgent implements INodeType {
 						description: 'Limit extended thinking (0 = unlimited)',
 					},
 
-					// --- 工具权限 ---
+					// --- Tool Permissions ---
 					{
 						displayName: 'Allowed Tools',
 						name: 'allowedTools',
 						type: 'multiOptions',
 						options: [
+							{ name: 'AskUserQuestion', value: 'AskUserQuestion' },
 							{ name: 'Bash', value: 'Bash' },
+							{ name: 'Config', value: 'Config' },
 							{ name: 'Edit', value: 'Edit' },
 							{ name: 'Glob', value: 'Glob' },
 							{ name: 'Grep', value: 'Grep' },
+							{ name: 'KillShell', value: 'KillShell' },
+							{ name: 'ListMcpResources', value: 'ListMcpResources' },
+							{ name: 'NotebookEdit', value: 'NotebookEdit' },
 							{ name: 'Read', value: 'Read' },
+							{ name: 'ReadMcpResource', value: 'ReadMcpResource' },
 							{ name: 'Task', value: 'Task' },
+							{ name: 'TaskOutput', value: 'TaskOutput' },
 							{ name: 'TodoWrite', value: 'TodoWrite' },
 							{ name: 'WebFetch', value: 'WebFetch' },
 							{ name: 'WebSearch', value: 'WebSearch' },
@@ -610,12 +724,19 @@ export class ClaudeAgent implements INodeType {
 						name: 'disallowedTools',
 						type: 'multiOptions',
 						options: [
+							{ name: 'AskUserQuestion', value: 'AskUserQuestion' },
 							{ name: 'Bash', value: 'Bash' },
+							{ name: 'Config', value: 'Config' },
 							{ name: 'Edit', value: 'Edit' },
 							{ name: 'Glob', value: 'Glob' },
 							{ name: 'Grep', value: 'Grep' },
+							{ name: 'KillShell', value: 'KillShell' },
+							{ name: 'ListMcpResources', value: 'ListMcpResources' },
+							{ name: 'NotebookEdit', value: 'NotebookEdit' },
 							{ name: 'Read', value: 'Read' },
+							{ name: 'ReadMcpResource', value: 'ReadMcpResource' },
 							{ name: 'Task', value: 'Task' },
+							{ name: 'TaskOutput', value: 'TaskOutput' },
 							{ name: 'TodoWrite', value: 'TodoWrite' },
 							{ name: 'WebFetch', value: 'WebFetch' },
 							{ name: 'WebSearch', value: 'WebSearch' },
@@ -652,7 +773,67 @@ export class ClaudeAgent implements INodeType {
 						],
 					},
 
-					// --- 调试 ---
+					// --- Environment Variables ---
+					{
+						displayName: 'Environment Variables',
+						name: 'environmentVariables',
+						type: 'fixedCollection',
+						typeOptions: { multipleValues: true },
+						default: {},
+						placeholder: 'Add Variable',
+						options: [
+							{
+								displayName: 'Variables',
+								name: 'variables',
+								values: [
+									{
+										displayName: 'Name',
+										name: 'name',
+										type: 'string',
+										default: '',
+									},
+									{
+										displayName: 'Value',
+										name: 'value',
+										type: 'string',
+										default: '',
+									},
+								],
+							},
+						],
+					},
+
+					// --- Session ---
+					{
+						displayName: 'Persist Session',
+						name: 'persistSession',
+						type: 'boolean',
+						default: true,
+					},
+
+					// --- Settings Sources ---
+					{
+						displayName: 'Settings Sources',
+						name: 'settingSources',
+						type: 'multiOptions',
+						options: [
+							{
+								name: 'User (~/.claude/settings.json)',
+								value: 'user',
+							},
+							{
+								name: 'Project (.claude/settings.json + CLAUDE.md)',
+								value: 'project',
+							},
+							{
+								name: 'Local (.claude/settings.local.json)',
+								value: 'local',
+							},
+						],
+						default: [],
+					},
+
+					// --- Debug ---
 					{
 						displayName: 'Debug Mode',
 						name: 'debug',
@@ -669,6 +850,149 @@ export class ClaudeAgent implements INodeType {
 					},
 				],
 			},
+
+			// ============ MCP Servers ============
+			{
+				displayName: 'MCP Servers',
+				name: 'mcpServers',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				default: {},
+				placeholder: 'Add MCP Server',
+				options: [
+					{
+						displayName: 'Servers',
+						name: 'servers',
+						values: [
+							{
+								displayName: 'Server Name',
+								name: 'name',
+								type: 'string',
+								default: '',
+								placeholder: 'my-server',
+							},
+							{
+								displayName: 'Transport Type',
+								name: 'transportType',
+								type: 'options',
+								options: [
+									{ name: 'stdio', value: 'stdio' },
+									{ name: 'SSE', value: 'sse' },
+									{ name: 'HTTP', value: 'http' },
+								],
+								default: 'stdio',
+							},
+							{
+								displayName: 'Command',
+								name: 'command',
+								type: 'string',
+								default: '',
+								placeholder: 'npx',
+								displayOptions: {
+									show: {
+										transportType: ['stdio'],
+									},
+								},
+							},
+							{
+								displayName: 'Arguments',
+								name: 'args',
+								type: 'string',
+								default: '',
+								placeholder: '@modelcontextprotocol/server-filesystem /tmp',
+								description: 'Space-separated arguments',
+								displayOptions: {
+									show: {
+										transportType: ['stdio'],
+									},
+								},
+							},
+							{
+								displayName: 'Environment (JSON)',
+								name: 'env',
+								type: 'json',
+								default: '{}',
+								displayOptions: {
+									show: {
+										transportType: ['stdio'],
+									},
+								},
+							},
+							{
+								displayName: 'URL',
+								name: 'url',
+								type: 'string',
+								default: '',
+								placeholder: 'https://mcp.example.com/sse',
+								displayOptions: {
+									show: {
+										transportType: ['sse', 'http'],
+									},
+								},
+							},
+							{
+								displayName: 'Headers (JSON)',
+								name: 'headers',
+								type: 'json',
+								default: '{}',
+								displayOptions: {
+									show: {
+										transportType: ['sse', 'http'],
+									},
+								},
+							},
+						],
+					},
+				],
+			},
+
+			// ============ Custom Tools ============
+			{
+				displayName: 'Custom Tools',
+				name: 'customTools',
+				type: 'fixedCollection',
+				typeOptions: { multipleValues: true },
+				default: {},
+				placeholder: 'Add Custom Tool',
+				options: [
+					{
+						displayName: 'Tools',
+						name: 'tools',
+						values: [
+							{
+								displayName: 'Tool Name',
+								name: 'name',
+								type: 'string',
+								default: '',
+								placeholder: 'get_weather',
+							},
+							{
+								displayName: 'Description',
+								name: 'description',
+								type: 'string',
+								typeOptions: { rows: 2 },
+								default: '',
+								placeholder: 'Get current weather for a city',
+							},
+							{
+								displayName: 'Input Schema (JSON)',
+								name: 'inputSchema',
+								type: 'json',
+								default:
+									'{\n  "type": "object",\n  "properties": {\n    "query": { "type": "string", "description": "Input query" }\n  },\n  "required": ["query"]\n}',
+							},
+							{
+								displayName: 'Static Response',
+								name: 'staticResponse',
+								type: 'string',
+								typeOptions: { rows: 3 },
+								default: '',
+								placeholder: 'Tool response content...',
+							},
+						],
+					},
+				],
+			},
 		],
 	};
 
@@ -678,7 +1002,7 @@ export class ClaudeAgent implements INodeType {
 
 		for (let itemIndex = 0; itemIndex < items.length; itemIndex++) {
 			try {
-				// ========== 获取参数 ==========
+				// ========== Get Parameters ==========
 				const operation = this.getNodeParameter('operation', itemIndex) as string;
 				const prompt = this.getNodeParameter('prompt', itemIndex) as string;
 				const cwd = this.getNodeParameter('cwd', itemIndex, '') as string;
@@ -686,6 +1010,7 @@ export class ClaudeAgent implements INodeType {
 				const permissionMode = this.getNodeParameter('permissionMode', itemIndex) as string;
 				const maxTurns = this.getNodeParameter('maxTurns', itemIndex) as number;
 				const timeout = this.getNodeParameter('timeout', itemIndex) as number;
+				const maxBudgetUsd = this.getNodeParameter('maxBudgetUsd', itemIndex, 0) as number;
 				const outputFormat = this.getNodeParameter('outputFormat', itemIndex) as string;
 
 				const advancedOptions = this.getNodeParameter('advancedOptions', itemIndex, {}) as {
@@ -699,16 +1024,21 @@ export class ClaudeAgent implements INodeType {
 					additionalDirectories?: {
 						directories?: Array<{ path: string }>;
 					};
+					environmentVariables?: {
+						variables?: Array<{ name: string; value: string }>;
+					};
+					persistSession?: boolean;
+					settingSources?: string[];
 					debug?: boolean;
 					includePartialMessages?: boolean;
 				};
 
-				// ========== 验证 ==========
+				// ========== Validation ==========
 				if (!prompt?.trim()) {
 					throw new NodeOperationError(this.getNode(), 'Prompt is required', { itemIndex });
 				}
 
-				// ========== 构建 query 选项 ==========
+				// ========== Build Query Options ==========
 				const queryOptions: {
 					prompt: string;
 					options: any;
@@ -720,18 +1050,23 @@ export class ClaudeAgent implements INodeType {
 					},
 				};
 
-				// 工作目录
+				// Bypass permissions safety flag
+				if (permissionMode === 'bypassPermissions') {
+					queryOptions.options.allowDangerouslySkipPermissions = true;
+				}
+
+				// Working directory
 				if (cwd?.trim()) {
 					queryOptions.options.cwd = cwd.trim();
 				}
 
-				// 会话管理
+				// Session management
 				switch (operation) {
 					case 'continue':
 						queryOptions.options.continue = true;
 						break;
 
-					case 'resume':
+					case 'resume': {
 						const resumeSessionId = this.getNodeParameter('sessionId', itemIndex) as string;
 						if (!resumeSessionId?.trim()) {
 							throw new NodeOperationError(
@@ -742,8 +1077,9 @@ export class ClaudeAgent implements INodeType {
 						}
 						queryOptions.options.resume = resumeSessionId.trim();
 						break;
+					}
 
-					case 'fork':
+					case 'fork': {
 						const forkSessionId = this.getNodeParameter('sessionId', itemIndex) as string;
 						if (!forkSessionId?.trim()) {
 							throw new NodeOperationError(
@@ -755,9 +1091,10 @@ export class ClaudeAgent implements INodeType {
 						queryOptions.options.resume = forkSessionId.trim();
 						queryOptions.options.forkSession = true;
 						break;
+					}
 				}
 
-				// 限制设置
+				// Execution limits
 				if (maxTurns > 0) {
 					queryOptions.options.maxTurns = maxTurns;
 				}
@@ -768,12 +1105,49 @@ export class ClaudeAgent implements INodeType {
 					queryOptions.options.abortController = abortController;
 				}
 
-				// System prompt
-				if (advancedOptions.customSystemPrompt?.trim()) {
-					queryOptions.options.systemPrompt = advancedOptions.customSystemPrompt.trim();
+				if (maxBudgetUsd > 0) {
+					queryOptions.options.maxBudgetUsd = maxBudgetUsd;
 				}
 
-				// 模型配置
+				// Structured output
+				if (outputFormat === 'structured') {
+					const outputJsonSchema = this.getNodeParameter(
+						'outputJsonSchema',
+						itemIndex,
+					) as string;
+					try {
+						const schema = JSON.parse(outputJsonSchema);
+						queryOptions.options.outputFormat = { type: 'json_schema', schema };
+					} catch {
+						throw new NodeOperationError(
+							this.getNode(),
+							'Invalid JSON schema for structured output',
+							{ itemIndex },
+						);
+					}
+				}
+
+				// System prompt
+				const systemPromptMode = advancedOptions.systemPromptMode || 'default';
+				switch (systemPromptMode) {
+					case 'append':
+						if (advancedOptions.appendSystemPrompt?.trim()) {
+							queryOptions.options.systemPrompt = {
+								type: 'preset',
+								preset: 'claude_code',
+								append: advancedOptions.appendSystemPrompt.trim(),
+							};
+						}
+						break;
+					case 'custom':
+						if (advancedOptions.customSystemPrompt?.trim()) {
+							queryOptions.options.systemPrompt =
+								advancedOptions.customSystemPrompt.trim();
+						}
+						break;
+				}
+
+				// Model configuration
 				if (advancedOptions.fallbackModel) {
 					queryOptions.options.fallbackModel = advancedOptions.fallbackModel;
 				}
@@ -781,7 +1155,7 @@ export class ClaudeAgent implements INodeType {
 					queryOptions.options.maxThinkingTokens = advancedOptions.maxThinkingTokens;
 				}
 
-				// 工具权限
+				// Tool permissions
 				if (advancedOptions.allowedTools && advancedOptions.allowedTools.length > 0) {
 					queryOptions.options.allowedTools = advancedOptions.allowedTools;
 				}
@@ -797,12 +1171,215 @@ export class ClaudeAgent implements INodeType {
 					}
 				}
 
-				// 流式事件
+				// Environment variables
+				if (advancedOptions.environmentVariables?.variables) {
+					const envVars: Record<string, string> = {};
+					for (const v of advancedOptions.environmentVariables.variables) {
+						if (v.name?.trim()) {
+							envVars[v.name.trim()] = v.value || '';
+						}
+					}
+					if (Object.keys(envVars).length > 0) {
+						queryOptions.options.env = envVars;
+					}
+				}
+
+				// Session persistence
+				if (advancedOptions.persistSession === false) {
+					queryOptions.options.persistSession = false;
+				}
+
+				// Settings sources
+				if (advancedOptions.settingSources && advancedOptions.settingSources.length > 0) {
+					queryOptions.options.settingSources = advancedOptions.settingSources;
+				}
+
+				// MCP Servers
+				const mcpServersConfig = this.getNodeParameter('mcpServers', itemIndex, {}) as {
+					servers?: Array<{
+						name: string;
+						transportType: string;
+						command?: string;
+						args?: string;
+						env?: string;
+						url?: string;
+						headers?: string;
+					}>;
+				};
+
+				if (mcpServersConfig.servers && mcpServersConfig.servers.length > 0) {
+					const mcpServers: Record<string, any> = {};
+
+					for (const server of mcpServersConfig.servers) {
+						if (!server.name?.trim()) continue;
+						const name = server.name.trim();
+
+						switch (server.transportType) {
+							case 'stdio': {
+								if (!server.command?.trim()) {
+									throw new NodeOperationError(
+										this.getNode(),
+										`MCP server "${name}": command is required for stdio transport`,
+										{ itemIndex },
+									);
+								}
+								const stdioConfig: any = {
+									type: 'stdio',
+									command: server.command.trim(),
+								};
+								if (server.args?.trim()) {
+									stdioConfig.args = server.args.trim().split(/\s+/);
+								}
+								if (server.env?.trim() && server.env.trim() !== '{}') {
+									try {
+										stdioConfig.env = JSON.parse(server.env);
+									} catch {
+										throw new NodeOperationError(
+											this.getNode(),
+											`MCP server "${name}": invalid JSON in env`,
+											{ itemIndex },
+										);
+									}
+								}
+								mcpServers[name] = stdioConfig;
+								break;
+							}
+							case 'sse':
+							case 'http': {
+								if (!server.url?.trim()) {
+									throw new NodeOperationError(
+										this.getNode(),
+										`MCP server "${name}": url is required for ${server.transportType} transport`,
+										{ itemIndex },
+									);
+								}
+								const httpConfig: any = {
+									type: server.transportType,
+									url: server.url.trim(),
+								};
+								if (
+									server.headers?.trim() &&
+									server.headers.trim() !== '{}'
+								) {
+									try {
+										httpConfig.headers = JSON.parse(server.headers);
+									} catch {
+										throw new NodeOperationError(
+											this.getNode(),
+											`MCP server "${name}": invalid JSON in headers`,
+											{ itemIndex },
+										);
+									}
+								}
+								mcpServers[name] = httpConfig;
+								break;
+							}
+						}
+					}
+
+					if (Object.keys(mcpServers).length > 0) {
+						queryOptions.options.mcpServers = {
+							...queryOptions.options.mcpServers,
+							...mcpServers,
+						};
+					}
+				}
+
+				// Custom Tools (inline)
+				const customToolsConfig = this.getNodeParameter('customTools', itemIndex, {}) as {
+					tools?: Array<{
+						name: string;
+						description: string;
+						inputSchema: string;
+						staticResponse: string;
+					}>;
+				};
+
+				const allToolDefs = customToolsConfig.tools || [];
+
+				const sdkTools: Array<ReturnType<typeof tool>> = [];
+
+				if (allToolDefs.length > 0) {
+					for (const t of allToolDefs) {
+						if (!t.name?.trim()) continue;
+
+						let schema: any = {};
+						if (t.inputSchema?.trim()) {
+							try {
+								schema = JSON.parse(t.inputSchema);
+							} catch {
+								throw new NodeOperationError(
+									this.getNode(),
+									`Custom tool "${t.name}": invalid JSON in input schema`,
+									{ itemIndex },
+								);
+							}
+						}
+
+						const zodShape = jsonSchemaToZodShape(schema);
+						const response = t.staticResponse || '';
+
+						sdkTools.push(
+							tool(t.name.trim(), t.description || '', zodShape, async () => ({
+								content: [{ type: 'text' as const, text: response }],
+							})),
+						);
+					}
+				}
+
+				// Read connected AI tools (ai_tool input)
+				try {
+					const aiToolData = await this.getInputConnectionData(
+						NodeConnectionTypes.AiTool,
+						itemIndex,
+					) as any[];
+					if (Array.isArray(aiToolData)) {
+						const lcTools = aiToolData.flatMap((t: any) =>
+							Array.isArray(t?.tools) ? t.tools : [t],
+						).filter((t: any) => t?.name);
+
+						for (const lcTool of lcTools) {
+							sdkTools.push(
+								tool(
+									lcTool.name,
+									lcTool.description || '',
+									lcTool.schema?.shape || {},
+									async (input: any) => {
+										try {
+											const result = await lcTool.invoke(input);
+											const text = typeof result === 'string'
+												? result : JSON.stringify(result);
+											return { content: [{ type: 'text' as const, text }] };
+										} catch (error: any) {
+											return { content: [{
+												type: 'text' as const,
+												text: `Error: ${error?.message || String(error)}`,
+											}] };
+										}
+									},
+								),
+							);
+						}
+					}
+				} catch { /* ai_tool input not connected */ }
+
+				if (sdkTools.length > 0) {
+					const customMcpServer = createSdkMcpServer({
+						name: 'n8n-custom-tools',
+						tools: sdkTools,
+					});
+					if (!queryOptions.options.mcpServers) {
+						queryOptions.options.mcpServers = {};
+					}
+					queryOptions.options.mcpServers['n8n-custom-tools'] = customMcpServer;
+				}
+
+				// Streaming events
 				if (advancedOptions.includePartialMessages) {
 					queryOptions.options.includePartialMessages = true;
 				}
 
-				// ========== 执行查询 ==========
+				// ========== Execute Query ==========
 				const messages: SDKMessage[] = [];
 				const startTime = Date.now();
 
@@ -816,7 +1393,7 @@ export class ClaudeAgent implements INodeType {
 				}
 
 				for await (const message of query(queryOptions)) {
-					// 过滤流式事件（除非明确要求）
+					// Filter streaming events unless explicitly requested
 					if (!advancedOptions.includePartialMessages && message.type === 'stream_event') {
 						continue;
 					}
@@ -831,7 +1408,7 @@ export class ClaudeAgent implements INodeType {
 					}
 				}
 
-				// ========== 格式化输出 ==========
+				// ========== Format Output ==========
 				let outputData: any;
 
 				switch (outputFormat) {
@@ -845,6 +1422,10 @@ export class ClaudeAgent implements INodeType {
 
 					case 'full':
 						outputData = formatAsFull(messages);
+						break;
+
+					case 'structured':
+						outputData = formatAsStructured(messages);
 						break;
 				}
 

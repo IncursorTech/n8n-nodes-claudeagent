@@ -17,7 +17,7 @@
 		},
 		"permissionMode": {
 			"type": "string",
-			"enum": ["bypassPermissions", "acceptEdits", "default", "plan"],
+			"enum": ["bypassPermissions", "acceptEdits", "default", "plan", "dontAsk", "delegate"],
 			"description": "How to handle tool permissions"
 		},
 		"maxTurns": {
@@ -28,10 +28,18 @@
 			"type": "number",
 			"description": "Maximum execution time in seconds (0 = unlimited)"
 		},
+		"maxBudgetUsd": {
+			"type": "number",
+			"description": "Maximum budget in USD (0 = unlimited)"
+		},
 		"outputFormat": {
 			"type": "string",
-			"enum": ["summary", "full", "text"],
+			"enum": ["summary", "full", "text", "structured"],
 			"description": "How to format the output"
+		},
+		"outputJsonSchema": {
+			"type": "object",
+			"description": "JSON schema for structured output (required when outputFormat is 'structured')"
 		},
 		"advancedOptions": {
 			"type": "object",
@@ -76,6 +84,22 @@
 					"type": "string",
 					"description": "Extra directories to grant access (comma-separated)"
 				},
+				"environmentVariables": {
+					"type": "object",
+					"description": "Environment variables as key-value pairs"
+				},
+				"persistSession": {
+					"type": "boolean",
+					"description": "Whether to persist the session to disk (default: true)"
+				},
+				"settingSources": {
+					"type": "array",
+					"items": {
+						"type": "string",
+						"enum": ["user", "project", "local"]
+					},
+					"description": "Which settings files to load"
+				},
 				"debug": {
 					"type": "boolean",
 					"description": "Enable detailed logging"
@@ -85,6 +109,14 @@
 					"description": "Include real-time streaming events (full format only)"
 				}
 			}
+		},
+		"mcpServers": {
+			"type": "object",
+			"description": "MCP server configurations"
+		},
+		"customTools": {
+			"type": "object",
+			"description": "Custom tool definitions with static responses"
 		}
 	},
 	"required": ["prompt"],
